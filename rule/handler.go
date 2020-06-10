@@ -29,29 +29,32 @@ func (client *QRadarClient) RetrieveQRadarRules(filter string) ([]ParsedRule, er
 	qradarRules, err := client.api.RuleWithData.Get(context.Background(), "", filter, 0, 0)
 
 	for _, qradarRule := range qradarRules {
-		parsedRule := ParsedRule{
-			Id:               *qradarRule.ID,
-			Name:             *qradarRule.Name,
-			Identifier:       *qradarRule.Identifier,
-			CreationDate:     time.Unix(int64(*qradarRule.CreationDate/1000), 0),
-			ModificationDate: time.Unix(int64(*qradarRule.ModificationDate/1000), 0),
-			Enabled:          *qradarRule.Enabled,
-			Owner:            *qradarRule.Owner,
-			RuleXML:          *qradarRule.RuleXML,
-		}
 		ruleXML, err := UnmarshalRule(*qradarRule.RuleXML)
 		if err != nil {
 			return nil, err
 		}
 
-		condition, err := ParseConditions(ruleXML)
-		if err != nil {
-			return nil, err
+		if !ruleXML.BuildingBlock {
+			parsedRule := ParsedRule{
+				Id:               *qradarRule.ID,
+				Name:             *qradarRule.Name,
+				Identifier:       *qradarRule.Identifier,
+				CreationDate:     time.Unix(int64(*qradarRule.CreationDate/1000), 0),
+				ModificationDate: time.Unix(int64(*qradarRule.ModificationDate/1000), 0),
+				Enabled:          *qradarRule.Enabled,
+				Owner:            *qradarRule.Owner,
+				RuleXML:          *qradarRule.RuleXML,
+			}
+
+			condition, err := ParseConditions(ruleXML)
+			if err != nil {
+				return nil, err
+			}
+
+			parsedRule.Conditions = condition
+
+			result = append(result, parsedRule)
 		}
-
-		parsedRule.Conditions = condition
-
-		result = append(result, parsedRule)
 	}
 
 	return result, err

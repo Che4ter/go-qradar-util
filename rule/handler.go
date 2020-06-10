@@ -3,6 +3,7 @@ package rule
 import (
 	"context"
 	"encoding/xml"
+	"errors"
 	"github.com/ilyaglow/go-qradar"
 	"regexp"
 	"strings"
@@ -64,7 +65,9 @@ func (client *QRadarClient) RetrieveBuildingBlock(identifier string) (ParsedBuil
 	filter := "identifier=\"" + identifier + "\""
 
 	qradarBuildingBlock, err := client.api.BuildingBlockWithData.Get(context.Background(), "", filter, 0, 0)
-
+	if err != nil{
+		return ParsedBuildingBlock{}, err
+	}
 	if len(qradarBuildingBlock) == 1 {
 		parsedBb := ParsedBuildingBlock{
 			Id:               *qradarBuildingBlock[0].ID,
@@ -90,7 +93,7 @@ func (client *QRadarClient) RetrieveBuildingBlock(identifier string) (ParsedBuil
 		return parsedBb, nil
 	}
 
-	return ParsedBuildingBlock{}, err
+	return ParsedBuildingBlock{}, errors.New("error: building block with identifier " + identifier + " not found. Maybe it's a rule?")
 }
 
 func UnmarshalRule(rule_xml string) (RuleXML, error) {

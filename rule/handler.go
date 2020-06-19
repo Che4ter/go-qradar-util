@@ -1,9 +1,11 @@
 package rule
 
 import (
+	"container/list"
 	"context"
 	"encoding/xml"
-	"errors"
+	"fmt"
+	"github.com/Che4ter/dag"
 	"github.com/ilyaglow/go-qradar"
 	"regexp"
 	"strings"
@@ -24,76 +26,132 @@ func NewClient(baseUrl string, securityToken string) (*QRadarClient, error) {
 	}, nil
 }
 
-func (client *QRadarClient) RetrieveQRadarRules(filter string) ([]ParsedRule, error) {
-	var result []ParsedRule
+func (client *QRadarClient) RetrieveParsedQRadarRules(filter string) (map[string]*ParsedRule, error) {
+	rules, err := client.api.RuleWithData.Get(context.Background(), "", filter, 0, 0)
+	if err != nil {
+		return nil, err
+	}
 
-	qradarRules, err := client.api.RuleWithData.Get(context.Background(), "", filter, 0, 0)
+	buildingBlocks, err := client.api.BuildingBlockWithData.Get(context.Background(), filter, "", 0, 0)
+	if err != nil {
+		return nil, err
+	}
 
-	for _, qradarRule := range qradarRules {
-		ruleXML, err := UnmarshalRule(*qradarRule.RuleXML)
+	ruleByName := make(map[string]*ParsedRule)
+	ruleByIdentifier := make(map[string]*ParsedRule)
+
+	for _, rule := range rules {
+		parsedRule, err := apiQRadarRuleToParsedRule(&rule)
 		if err != nil {
 			return nil, err
 		}
 
-		if !ruleXML.BuildingBlock {
-			parsedRule := ParsedRule{
-				Id:               *qradarRule.ID,
-				Name:             *qradarRule.Name,
-				Identifier:       *qradarRule.Identifier,
-				CreationDate:     time.Unix(int64(*qradarRule.CreationDate/1000), 0),
-				ModificationDate: time.Unix(int64(*qradarRule.ModificationDate/1000), 0),
-				Enabled:          *qradarRule.Enabled,
-				Owner:            *qradarRule.Owner,
-				RuleXML:          *qradarRule.RuleXML,
-			}
+		ruleByName[parsedRule.Name] = parsedRule
+		ruleByIdentifier[parsedRule.Identifier] = parsedRule
+	}
 
-			condition, err := ParseConditions(ruleXML)
-			if err != nil {
-				return nil, err
-			}
+	for _, buildingBlock := range buildingBlocks {
+		if _, hasKey := ruleByIdentifier[*buildingBlock.Identifier]; !hasKey {
+			parsedRule := apiQRadarBuildingBlockToParsedRule(&buildingBlock)
 
-			parsedRule.Conditions = condition
-
-			result = append(result, parsedRule)
+			ruleByName[parsedRule.Name] = parsedRule
+			ruleByIdentifier[parsedRule.Identifier] = parsedRule
 		}
 	}
 
-	return result, err
+	for _, rule := range ruleByIdentifier {
+		rule.Conditions, _ = parseConditions(rule, ruleByIdentifier)
+	}
+
+	return ruleByName, nil
 }
 
-func (client *QRadarClient) RetrieveBuildingBlock(identifier string) (ParsedBuildingBlock, error) {
-	filter := "identifier=\"" + identifier + "\""
-
-	qradarBuildingBlock, err := client.api.BuildingBlockWithData.Get(context.Background(), "", filter, 0, 0)
-	if err != nil{
-		return ParsedBuildingBlock{}, err
-	}
-	if len(qradarBuildingBlock) == 1 {
-		parsedBb := ParsedBuildingBlock{
-			Id:               *qradarBuildingBlock[0].ID,
-			Name:             *qradarBuildingBlock[0].Name,
-			Identifier:       *qradarBuildingBlock[0].Identifier,
-			CreationDate:     time.Unix(int64(*qradarBuildingBlock[0].CreationDate/1000), 0),
-			ModificationDate: time.Unix(int64(*qradarBuildingBlock[0].ModificationDate/1000), 0),
-			Owner:            *qradarBuildingBlock[0].Owner,
-			Enabled:          *qradarBuildingBlock[0].Enabled,
-			RuleXML:          *qradarBuildingBlock[0].RuleXML,
-		}
-		ruleXML, err := UnmarshalRule(*qradarBuildingBlock[0].RuleXML)
-		if err != nil {
-			return ParsedBuildingBlock{}, err
-		}
-
-		condition, err := ParseConditions(ruleXML)
-		if err != nil {
-			return ParsedBuildingBlock{}, err
-		}
-
-		parsedBb.Conditions = condition
-		return parsedBb, nil
+func (client *QRadarClient) RetrieveRuleByIdentifier(identifier string) (*ParsedRule, error) {
+	rules, err := client.api.RuleWithData.Get(context.Background(), "", "", 0, 0)
+	if err != nil {
+		return nil, err
 	}
 
-	return ParsedBuildingBlock{}, errors.New("error: building block with identifier " + identifier + " not found. Maybe it's a rule?")
+	buildingBlocks, err := client.api.BuildingBlockWithData.Get(context.Background(), "", "", 0, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	ruleByIdentifier := make(map[string]*ParsedRule)
+
+	for _, rule := range rules {
+		parsedRule, err := apiQRadarRuleToParsedRule(&rule)
+		if err != nil {
+			return nil, err
+		}
+
+		ruleByIdentifier[parsedRule.Identifier] = parsedRule
+	}
+
+	for _, buildingBlock := range buildingBlocks {
+		if _, hasKey := ruleByIdentifier[*buildingBlock.Identifier]; !hasKey {
+			parsedRule := apiQRadarBuildingBlockToParsedRule(&buildingBlock)
+
+			ruleByIdentifier[parsedRule.Identifier] = parsedRule
+		}
+	}
+
+	for _, rule := range ruleByIdentifier {
+		if rule.Identifier == identifier {
+			rule.Conditions, _ = parseConditions(rule, ruleByIdentifier)
+			return rule, nil
+		}
+
+	}
+
+	return nil, fmt.Errorf("rule with Identifier %s not found", identifier)
+}
+
+func (client *QRadarClient) GenerateRuleGraph(regexFilter string, filterIsInclusive bool) (*dag.DAG, error) {
+	rules, err := client.RetrieveParsedQRadarRules("")
+	if err != nil {
+		return nil, err
+	}
+
+	contentGraph := dag.NewDAG()
+	regex, _ := regexp.Compile(regexFilter)
+
+	resolvedDependencies := make(map[string]*dag.Vertex)
+	unresolvedDependencyQueue := list.New()
+	for ruleName, rule := range rules {
+		isRegexMatch := regex.MatchString(rule.Name)
+		if !rule.IsBuildingBlock && (isRegexMatch && filterIsInclusive) || (!isRegexMatch && !filterIsInclusive) {
+			if !contentGraph.VertexExists(ruleName) {
+				newNode := dag.NewVertex(ruleName, rule)
+				contentGraph.AddVertex(newNode)
+				resolvedDependencies[ruleName] = newNode
+
+				unresolvedDependencies := resolveRuleDependencies(contentGraph, newNode, rules)
+				for _, dependencyName := range unresolvedDependencies {
+					unresolvedDependencyQueue.PushBack(dependencyName)
+				}
+			}
+		}
+	}
+
+	for unresolvedDependencyQueue.Len() > 0 {
+		nextDependency := unresolvedDependencyQueue.Front()
+		nextDependencyName := nextDependency.Value.(string)
+		nodeToResolve, err := contentGraph.GetVertex(nextDependencyName)
+		if err != nil {
+			return nil, err
+		}
+
+		unresolvedDependencies := resolveRuleDependencies(contentGraph, nodeToResolve, rules)
+		resolvedDependencies[nextDependencyName] = nodeToResolve
+		unresolvedDependencyQueue.Remove(nextDependency)
+		for _, dependencyName := range unresolvedDependencies {
+			if _, ok := resolvedDependencies[nextDependencyName]; !ok {
+				unresolvedDependencyQueue.PushBack(dependencyName)
+			}
+		}
+	}
+	return contentGraph, err
 }
 
 func UnmarshalRule(rule_xml string) (RuleXML, error) {
@@ -102,11 +160,74 @@ func UnmarshalRule(rule_xml string) (RuleXML, error) {
 	return ruleXML, err
 }
 
-func ParseConditions(rule RuleXML) ([]Conditions, error) {
+func apiQRadarRuleToParsedRule(apiRule *qradar.RuleWithData) (*ParsedRule, error) {
+	ruleXML, err := UnmarshalRule(*apiRule.RuleXML)
+	if err != nil {
+		return &ParsedRule{}, err
+	}
+
+	parsedRule := ParsedRule{
+		Id:               *apiRule.ID,
+		Name:             *apiRule.Name,
+		Identifier:       *apiRule.Identifier,
+		CreationDate:     time.Unix(int64(*apiRule.CreationDate/1000), 0),
+		ModificationDate: time.Unix(int64(*apiRule.ModificationDate/1000), 0),
+		Enabled:          *apiRule.Enabled,
+		Owner:            *apiRule.Owner,
+		RuleXML:          *apiRule.RuleXML,
+		IsBuildingBlock:  ruleXML.BuildingBlock,
+	}
+	return &parsedRule, nil
+}
+
+func apiQRadarBuildingBlockToParsedRule(apiRule *qradar.BuildingBlockWithData) *ParsedRule {
+	parsedRule := ParsedRule{
+		Id:               *apiRule.ID,
+		Name:             *apiRule.Name,
+		Identifier:       *apiRule.Identifier,
+		CreationDate:     time.Unix(int64(*apiRule.CreationDate/1000), 0),
+		ModificationDate: time.Unix(int64(*apiRule.ModificationDate/1000), 0),
+		Enabled:          *apiRule.Enabled,
+		Owner:            *apiRule.Owner,
+		RuleXML:          *apiRule.RuleXML,
+		IsBuildingBlock:  true,
+	}
+	return &parsedRule
+}
+
+func resolveRuleDependencies(contentGraph *dag.DAG, node *dag.Vertex, allRules map[string]*ParsedRule) []string {
+	var newDependencies []string
+	ruleToResolve := node.Value.(*ParsedRule)
+	for _, condition := range ruleToResolve.Conditions {
+		for _, dependencyName := range condition.Dependencies {
+			childNode, err := contentGraph.GetVertex(dependencyName)
+			if err != nil {
+				if childRule, ok := allRules[dependencyName]; ok {
+					childNode = dag.NewVertex(dependencyName, childRule)
+					newDependencies = append(newDependencies, dependencyName)
+					if err := contentGraph.AddVertex(childNode); err != nil {
+						return nil
+					}
+				}
+			}
+			if err := contentGraph.AddEdge(node, childNode); err != nil {
+				return nil
+			}
+		}
+	}
+	return newDependencies
+}
+
+func parseConditions(rule *ParsedRule, allRules map[string]*ParsedRule) ([]Conditions, error) {
 	var testDefinitions []Conditions
 	r, _ := regexp.Compile("<\\s*a[^>]*>(.*?)<\\s*/\\s*a>")
 
-	for _, test := range rule.TestDefinitions.Test {
+	ruleXML, err := UnmarshalRule(rule.RuleXML)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, test := range ruleXML.TestDefinitions.Test {
 		testDefinition := Conditions{}
 		matches := r.FindAllStringSubmatch(test.Text, -1)
 		for _, match := range matches {
@@ -117,7 +238,15 @@ func ParseConditions(rule RuleXML) ([]Conditions, error) {
 
 		for _, parameter := range test.Parameter {
 			if parameter.Name == "getEventRules" && parameter.UserSelection != " " {
-				testDefinition.BuildingBlockIdentifiers = strings.Split(parameter.UserSelection, ", ")
+				identifiers := strings.Split(parameter.UserSelection, ", ")
+				testDefinition.Dependencies = make([]string, 0, len(identifiers))
+				for _, identifier := range identifiers {
+					if parsedRule, ok := allRules[identifier]; ok {
+						testDefinition.Dependencies = append(testDefinition.Dependencies, parsedRule.Name)
+					} else {
+						return nil, fmt.Errorf("rule with identifier %s not found", identifier)
+					}
+				}
 			}
 		}
 		testDefinition.Condition = r.ReplaceAllString(test.Text, "{}")
@@ -125,7 +254,6 @@ func ParseConditions(rule RuleXML) ([]Conditions, error) {
 		testDefinition.Negate = test.Negate
 
 		testDefinitions = append(testDefinitions, testDefinition)
-
 	}
 
 	return testDefinitions, nil
@@ -145,25 +273,14 @@ type ParsedRule struct {
 	Enabled          bool
 	Conditions       []Conditions
 	RuleXML          string
-}
-
-type ParsedBuildingBlock struct {
-	Id               int
-	Name             string
-	Identifier       string
-	CreationDate     time.Time
-	ModificationDate time.Time
-	Owner            string
-	Enabled          bool
-	Conditions       []Conditions
-	RuleXML          string
+	IsBuildingBlock  bool
 }
 
 type Conditions struct {
-	Negate                   bool
-	Condition                string
-	Selections               []string
-	BuildingBlockIdentifiers []string
+	Negate       bool
+	Condition    string
+	Selections   []string
+	Dependencies []string
 }
 
 type RuleXML struct {

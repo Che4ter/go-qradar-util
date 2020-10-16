@@ -235,11 +235,10 @@ func parseConditions(rule *ParsedRule, allRules map[string]*ParsedRule) ([]Condi
 				testDefinition.Selections = append(testDefinition.Selections, match[1])
 			}
 		}
-
+		testDefinition.Dependencies = []string{}
 		for _, parameter := range test.Parameter {
 			if parameter.Name == "getEventRules" && parameter.UserSelection != " " {
 				identifiers := strings.Split(parameter.UserSelection, ", ")
-				testDefinition.Dependencies = make([]string, 0, len(identifiers))
 				for _, identifier := range identifiers {
 					if parsedRule, ok := allRules[identifier]; ok {
 						testDefinition.Dependencies = append(testDefinition.Dependencies, parsedRule.Name)
